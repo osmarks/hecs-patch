@@ -7,6 +7,7 @@ use core::num::{NonZeroU32, NonZeroU64};
 use core::ops::Range;
 use core::sync::atomic::{AtomicIsize, Ordering};
 use core::{fmt, mem};
+use hashbrown::{HashMap, HashSet};
 
 /// Lightweight unique ID, or handle, of an entity
 ///
@@ -367,6 +368,80 @@ impl Entities {
         self.meta[entity.id as usize].generation = entity.generation;
 
         loc
+    }
+
+    /// Bulk version of [`Self::alloc_at`].
+    ///
+    /// Returns locations currently using each requested ID (if any), in the same order as
+    /// `entities`.
+    pub fn alloc_many_at(&mut self, entities: &[Entity]) -> Vec<Option<Location>> {
+        self.verify_flushed();
+
+        let old_meta_len = self.meta.len();
+        let mut max_id = old_meta_len as u32;
+        for &entity in entities {
+            let next = entity.id.checked_add(1).expect("too many entities");
+            if next > max_id {
+                max_id = next;
+            }
+        }
+        if max_id as usize > old_meta_len {
+            self.meta.resize(max_id as usize, EntityMeta::EMPTY);
+        }
+
+        let mut pending_index = HashMap::with_capacity(self.pending.len());
+        for (index, &id) in self.pending.iter().enumerate() {
+            pending_index.insert(id, index);
+        }
+
+        let mut seen = HashSet::with_capacity(entities.len());
+        let mut allocated_high = HashSet::with_capacity(entities.len());
+        let mut newly_allocated = 0u32;
+        let mut old_locations = Vec::with_capacity(entities.len());
+        for &entity in entities {
+            if !seen.insert(entity.id) {
+                old_locations.push(Some(mem::replace(
+                    &mut self.meta[entity.id as usize].location,
+                    EntityMeta::EMPTY.location,
+                )));
+                self.meta[entity.id as usize].generation = entity.generation;
+                continue;
+            }
+
+            if entity.id as usize >= old_meta_len {
+                allocated_high.insert(entity.id);
+                newly_allocated += 1;
+                old_locations.push(None);
+            } else if let Some(index) = pending_index.remove(&entity.id) {
+                self.pending.swap_remove(index);
+                if index < self.pending.len() {
+                    let moved = self.pending[index];
+                    *pending_index.get_mut(&moved).unwrap() = index;
+                }
+                newly_allocated += 1;
+                old_locations.push(None);
+            } else {
+                old_locations.push(Some(mem::replace(
+                    &mut self.meta[entity.id as usize].location,
+                    EntityMeta::EMPTY.location,
+                )));
+            }
+
+            self.meta[entity.id as usize].generation = entity.generation;
+        }
+
+        if max_id as usize > old_meta_len {
+            self.pending.extend(
+                (old_meta_len as u32..max_id).filter(|id| {
+                    !pending_index.contains_key(id) && !allocated_high.contains(id)
+                }),
+            );
+        }
+
+        self.len += newly_allocated;
+        *self.free_cursor.get_mut() = self.pending.len() as isize;
+
+        old_locations
     }
 
     /// Destroy an entity, allowing it to be reused
@@ -877,5 +952,56 @@ mod tests {
             generation: NonZeroU32::new(1).unwrap(),
             id: 0
         }));
+    }
+
+    #[test]
+    fn alloc_many_at() {
+        let mut e = Entities::default();
+
+        let entities: Vec<_> = (0..5)
+            .map(|_| {
+                let entity = e.alloc();
+                e.meta[entity.id as usize].location = Location {
+                    archetype: 1,
+                    index: entity.id,
+                };
+                entity
+            })
+            .collect();
+
+        e.free(entities[1]).unwrap();
+        e.free(entities[3]).unwrap();
+
+        let replaced = e.alloc_many_at(&[
+            Entity {
+                id: 3,
+                generation: NonZeroU32::new(5).unwrap(),
+            },
+            Entity {
+                id: 2,
+                generation: NonZeroU32::new(7).unwrap(),
+            },
+            Entity {
+                id: 6,
+                generation: NonZeroU32::new(9).unwrap(),
+            },
+        ]);
+
+        assert_eq!(replaced.len(), 3);
+        assert!(replaced[0].is_none());
+        let replaced_live = replaced[1].unwrap();
+        assert_eq!(replaced_live.archetype, 1);
+        assert_eq!(replaced_live.index, 2);
+        assert!(replaced[2].is_none());
+
+        assert_eq!(e.meta.len(), 7);
+        assert_eq!(e.meta[2].generation.get(), 7);
+        assert_eq!(e.meta[3].generation.get(), 5);
+        assert_eq!(e.meta[6].generation.get(), 9);
+        assert_eq!(e.len(), 5);
+        assert!(e.pending.contains(&1));
+        assert!(e.pending.contains(&5));
+        assert!(!e.pending.contains(&3));
+        assert!(!e.pending.contains(&6));
     }
 }

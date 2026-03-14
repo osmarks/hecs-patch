@@ -250,9 +250,8 @@ impl World {
             archetype.len()
         );
 
-        // Drop components of entities that will be replaced
-        for &handle in handles {
-            let loc = self.entities.alloc_at(handle);
+        // Drop components of entities that will be replaced.
+        for loc in self.entities.alloc_many_at(handles) {
             if let Some(loc) = loc {
                 if let Some(moved) = unsafe {
                     self.archetypes.archetypes[loc.archetype as usize].remove(loc.index, true)
